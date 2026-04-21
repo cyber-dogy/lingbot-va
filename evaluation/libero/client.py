@@ -6,10 +6,10 @@ import time
 from libero.libero.envs import OffScreenRenderEnv
 from pathlib import Path
 from tqdm import tqdm
-from lerobot.datasets.utils import write_json
 import os
 import imageio
 import cv2
+import json
 
 
 def save_video(real_obs_list, save_path, fps=15, video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]):
@@ -30,6 +30,13 @@ def save_video(real_obs_list, save_path, fps=15, video_names=["observation.image
 
     imageio.mimsave(save_path, final_frames, fps=fps)
     print(f"✅ Video saved to: {save_path}")
+
+
+def write_json(data, out_file):
+    out_path = Path(out_file)
+    out_path.parent.mkdir(exist_ok=True, parents=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 def construct_single_env(env_args):
