@@ -26,10 +26,16 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
+flash_attn_func = None
 try:
-    from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+    from flash_attn_interface import flash_attn_func as _flash_attn_func
+    flash_attn_func = _flash_attn_func
+except Exception:
+    try:
+        from flash_attn import flash_attn_func as _flash_attn_func
+        flash_attn_func = _flash_attn_func
+    except Exception:
+        pass
 
 __all__ = ['WanTransformer3DModel']
 

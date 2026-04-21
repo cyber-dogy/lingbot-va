@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
+import re
 import sys
 import time
 from functools import partial
@@ -74,7 +75,8 @@ class VA_Server:
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'text_encoder'),
             torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
+            # 文本编码一次即可，单独放 CPU 能给 transformer KV cache 多留一点显存。
+            torch_device='cpu' if job_config.enable_text_encoder_offload or self.enable_offload else self.device,
         )
 
         self.transformer = load_transformer(
@@ -82,7 +84,8 @@ class VA_Server:
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
-            attn_mode="torch"
+            # 推理侧 attention 内核单独可配，避免为了切 torch / flashattn 去改权重目录。
+            attn_mode=job_config.infer_attn_mode,
         )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -99,7 +102,8 @@ class VA_Server:
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'vae'),
                 torch_dtype=self.dtype,
-                torch_device='cpu' if self.enable_offload else self.device,
+                # 双 wrist 只在首帧编码时用一次，单独放到 CPU 能明显降低本地单卡显存占用。
+                torch_device=job_config.aux_vae_device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
 
@@ -352,10 +356,12 @@ class VA_Server:
             videos_left_and_right = torch.cat(videos[1:],
                                               dim=0) / 255.0 * 2.0 - 1.0
             vae_device = next(self.streaming_vae.vae.parameters()).device
+            vae_half_device = next(self.streaming_vae_half.vae.parameters()).device
             enc_out_high = self.streaming_vae.encode_chunk(
                 videos_high.to(vae_device).to(self.dtype))
             enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
-                videos_left_and_right.to(vae_device).to(self.dtype))
+                videos_left_and_right.to(vae_half_device).to(self.dtype))
+            enc_out_left_and_right = enc_out_left_and_right.to(enc_out_high.device)
             enc_out = torch.cat([
                 torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
                 enc_out_high
@@ -435,7 +441,9 @@ class VA_Server:
                 dtype=self.dtype,
             )
 
-        self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
+        prompt_slug = re.sub(r"[^0-9A-Za-z._-]+", "_", prompt).strip("_")[:80] if prompt else "default"
+        # prompt 会落到输出目录名里，先做一次收敛，避免斜杠等字符把批量导出路径打碎。
+        self.exp_name = f"{prompt_slug}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
@@ -624,18 +632,20 @@ class VA_Server:
             return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
-        latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents = latents / latents_std + latents_mean
-        video = self.vae.decode(latents, return_dict=False)[0]
-        video = self.video_processor.postprocess_video(video, output_type=output_type)
+        with torch.no_grad():
+            latents = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+            video = self.vae.decode(latents, return_dict=False)[0]
+            # 导出离线 demo 时会转 numpy，这里先 detach，避免在后处理阶段踩 autograd 限制。
+            video = self.video_processor.postprocess_video(video.detach(), output_type=output_type)
         return video
     
     def load_init_obs(self):

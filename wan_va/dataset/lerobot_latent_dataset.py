@@ -9,6 +9,7 @@ import os
 from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
+import multiprocessing as mp
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
@@ -37,6 +38,31 @@ def construct_lerobot(
         config=config,
     )
 
+def filter_repo_list(repo_list, config):
+    repo_names = getattr(config, 'dataset_repo_names', None)
+    if repo_names is None:
+        return repo_list
+
+    selected_repo_names = [repo_name for repo_name in repo_names if repo_name]
+    if not selected_repo_names:
+        return repo_list
+
+    # 单任务实验直接按 repo 名筛选，避免为了抽一个 task 去改原始数据目录。
+    repo_name_set = set(selected_repo_names)
+    filtered_repo_list = [
+        repo_path for repo_path in repo_list
+        if os.path.basename(repo_path) in repo_name_set
+    ]
+    found_repo_name_set = {os.path.basename(repo_path) for repo_path in filtered_repo_list}
+    missing_repo_names = sorted(repo_name_set - found_repo_name_set)
+
+    if missing_repo_names:
+        raise FileNotFoundError(
+            f"Can not find dataset repos under {config.dataset_path}: {missing_repo_names}"
+        )
+
+    return filtered_repo_list
+
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
                                       ):
@@ -47,8 +73,22 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
+    repo_list = filter_repo_list(repo_list, config)
+    if not repo_list:
+        raise FileNotFoundError(f"No LeRobot repo found under {config.dataset_path}")
+
+    # 数据集 repo 数量本来就不多，初始化 worker 开太大反而会把首训 smoke 卡死。
+    resolved_num_init_worker = min(
+        num_init_worker,
+        len(repo_list),
+        mp.cpu_count(),
+    )
+
+    if resolved_num_init_worker <= 1:
+        datasets_out_lst = [construct_func(repo_id) for repo_id in repo_list]
+    else:
+        with Pool(resolved_num_init_worker) as pool:
+            datasets_out_lst = pool.map(construct_func, repo_list)
                 
     return datasets_out_lst
 
@@ -71,8 +111,10 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=128,
+        num_init_worker=None,
     ):
+        if num_init_worker is None:
+            num_init_worker = getattr(config, 'dataset_init_worker', 8)
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
                                                            )

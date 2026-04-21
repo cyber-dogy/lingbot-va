@@ -9,6 +9,9 @@ va_shared_cfg.port = 29536
 
 va_shared_cfg.param_dtype = torch.bfloat16
 va_shared_cfg.save_root = './train_out'
+va_shared_cfg.infer_attn_mode = 'torch'
+va_shared_cfg.aux_vae_device = 'cpu'
+va_shared_cfg.enable_text_encoder_offload = False
 
 va_shared_cfg.patch_size = (1, 2, 2)
 

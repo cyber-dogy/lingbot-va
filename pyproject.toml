@@ -21,11 +21,13 @@ dependencies = [
     "tqdm",
     "imageio",
     "easydict",
-    "flash_attn",
     "numpy>=1.26.4,<2"
 ]
 
 [project.optional-dependencies]
+flash = [
+    "flash_attn"
+]
 dev = [
     "pytest",
     "black",
@@ -44,10 +46,10 @@ modelscope = "https://github.com/Robbyant"
 discord = "https://github.com/Robbyant"
 
 [tool.setuptools]
-packages = ["lingbot_va"]
+packages = ["wan_va"]
 
 [tool.setuptools.package-data]
-"lingbot_va" = ["**/*.py"]
+"wan_va" = ["**/*.py"]
 
 [tool.black]
 line-length = 88

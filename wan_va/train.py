@@ -47,14 +47,96 @@ from dataset import MultiLatentLeRobotDataset
 import gc
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+
+    lowered = value.lower()
+    if lowered in {"true", "1", "yes", "y"}:
+        return True
+    if lowered in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def apply_config_overrides(config, args):
+    if args.save_root is not None:
+        config.save_root = args.save_root
+    if args.dataset_path is not None:
+        config.dataset_path = args.dataset_path
+    if args.empty_emb_path is not None:
+        config.empty_emb_path = args.empty_emb_path
+    if args.dataset_repo_name is not None:
+        config.dataset_repo_names = [args.dataset_repo_name]
+    if args.enable_wandb is not None:
+        config.enable_wandb = args.enable_wandb
+    if args.load_worker is not None:
+        config.load_worker = args.load_worker
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
+    if args.save_interval is not None:
+        config.save_interval = args.save_interval
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
+    if args.pretrained_model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.pretrained_model_path
+    if args.optimizer_type is not None:
+        config.optimizer_type = args.optimizer_type
+    if args.smoke_mode is not None:
+        config.smoke_mode = args.smoke_mode
+        if args.smoke_mode and not hasattr(config, 'optimizer_type'):
+            config.optimizer_type = 'sgd'
+
+
+def resolve_wandb_entity():
+    wandb_entity = os.getenv("WANDB_TEAM_NAME")
+    if wandb_entity:
+        return wandb_entity
+
+    # 优先复用本地 wandb login 的默认实体，避免每次手填 team name。
+    api = wandb.Api()
+    return api.default_entity
+
+
+def configure_trainable_params(model, smoke_mode=False):
+    if not smoke_mode:
+        model.requires_grad_(True)
+        return []
+
+    trainable_name_list = []
+    model.requires_grad_(False)
+    # smoke 只训练输出头，验证整条训练链路是否通，而不是追求有效收敛。
+    trainable_patterns = ("proj_out", "action_proj_out")
+    for name, param in model.named_parameters():
+        if any(pattern in name for pattern in trainable_patterns):
+            param.requires_grad_(True)
+            trainable_name_list.append(name)
+
+    if not trainable_name_list:
+        raise RuntimeError("Smoke mode could not find trainable output heads")
+
+    return trainable_name_list
+
+
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            wandb_base_url = os.getenv("WANDB_BASE_URL", "https://api.wandb.ai")
+            wandb_api_key = os.getenv("WANDB_API_KEY")
+            wandb_entity = resolve_wandb_entity()
+
+            login_kwargs = {
+                "host": wandb_base_url,
+                "relogin": False,
+            }
+            if wandb_api_key:
+                login_kwargs["key"] = wandb_api_key
+
+            wandb.login(**login_kwargs)
             self.wandb = wandb
             self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
+                entity=wandb_entity,
+                project=os.getenv("WANDB_PROJECT", "lingbot-va"),
                 # dir=log_dir,
                 config=config,
                 mode="online",
@@ -85,6 +167,8 @@ class Trainer:
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
+            # 训练态直接覆盖成 flex，避免来回修改官方权重目录里的 config.json。
+            attn_mode="flex",
         )
 
         logger.info("Setting up activation checkpointing ...")
@@ -100,18 +184,38 @@ class Trainer:
             eval_mode=False,
         )
         self.transformer.train()
-        self.transformer.requires_grad_(True)
-
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.transformer.parameters() if p.requires_grad],
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=1e-8,
-            weight_decay=config.weight_decay,
-            fused=True,
-            foreach=False,
+        trainable_name_list = configure_trainable_params(
+            self.transformer,
+            smoke_mode=getattr(config, 'smoke_mode', False),
         )
+        if config.rank == 0 and trainable_name_list:
+            logger.info(
+                "Smoke mode enabled, trainable params: %s",
+                ", ".join(trainable_name_list),
+            )
+
+        # smoke 验证时可以切到更轻的优化器，避免 Adam 状态把单卡显存挤爆。
+        optimizer_type = getattr(config, 'optimizer_type', 'adamw').lower()
+        trainable_params = [p for p in self.transformer.parameters() if p.requires_grad]
+        if optimizer_type == 'adamw':
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=1e-8,
+                weight_decay=config.weight_decay,
+                fused=True,
+                foreach=False,
+            )
+        elif optimizer_type == 'sgd':
+            self.optimizer = torch.optim.SGD(
+                trainable_params,
+                lr=config.learning_rate,
+                momentum=0.0,
+                weight_decay=config.weight_decay,
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")
 
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
@@ -144,6 +248,7 @@ class Trainer:
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
+        self.use_fsdp = dist.is_initialized() and dist.get_world_size() > 1
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
     
@@ -300,10 +405,11 @@ class Trainer:
         
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
         
-        if not should_sync:
-            self.transformer.set_requires_gradient_sync(False)
-        else:
-            self.transformer.set_requires_gradient_sync(True)
+        if self.use_fsdp:
+            if not should_sync:
+                self.transformer.set_requires_gradient_sync(False)
+            else:
+                self.transformer.set_requires_gradient_sync(True)
 
         output = self.transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self.compute_loss(input_dict, output)
@@ -330,10 +436,16 @@ class Trainer:
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
         try:
-            state_dict = get_model_state_dict(
-                self.transformer,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            )
+            if self.use_fsdp:
+                state_dict = get_model_state_dict(
+                    self.transformer,
+                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                )
+            else:
+                state_dict = {
+                    key: value.detach().cpu()
+                    for key, value in self.transformer.state_dict().items()
+                }
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
             # optim_state = get_optimizer_state_dict(
             #         self.transformer, self.optimizer,
@@ -505,6 +617,7 @@ class Trainer:
 def run(args):
     """Main entry point."""
     config = VA_CONFIGS[args.config_name]
+    apply_config_overrides(config, args)
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -515,9 +628,6 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
-
-    if args.save_root is not None:
-        config.save_root = args.save_root
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -541,6 +651,73 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Root directory of the LeRobot dataset",
+    )
+    parser.add_argument(
+        "--empty-emb-path",
+        type=str,
+        default=None,
+        help="Path to empty_emb.pt",
+    )
+    parser.add_argument(
+        "--dataset-repo-name",
+        type=str,
+        default=None,
+        help="Run training on a single LeRobot repo/task",
+    )
+    parser.add_argument(
+        "--enable-wandb",
+        type=str2bool,
+        default=None,
+        help="Enable or disable WandB logging",
+    )
+    parser.add_argument(
+        "--load-worker",
+        type=int,
+        default=None,
+        help="Number of dataloader workers",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Training steps for the current run",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=None,
+        help="Checkpoint save interval",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume checkpoint directory",
+    )
+    parser.add_argument(
+        "--pretrained-model-path",
+        type=str,
+        default=None,
+        help="Base pretrained model directory",
+    )
+    parser.add_argument(
+        "--optimizer-type",
+        type=str,
+        choices=["adamw", "sgd"],
+        default=None,
+        help="Optimizer type, use sgd for the lightest smoke test",
+    )
+    parser.add_argument(
+        "--smoke-mode",
+        type=str2bool,
+        default=None,
+        help="Freeze backbone and only train output heads for pipeline smoke testing",
     )
 
     args = parser.parse_args()

@@ -1,1 +1,17 @@
+# Python 运行缓存
+__pycache__/
 *.pyc
+
+# 本地数据集与模型权重，体积大且依赖机器环境
+data/
+models/
+
+# 训练、评测与调试输出
+train_out/
+eval_out/
+wandb/
+tmp_profile/
+
+# 本地下载与守护脚本产生的日志/进程标记
+*.log
+*.pid

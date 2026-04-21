@@ -3,9 +3,6 @@ import torch
 import torch.distributed as dist
 
 from .logging import logger
-from .Simple_Remote_Infer.deploy.websocket_policy_server import WebsocketPolicyServer
-
-
 class DistributedModelWrapper:
     """
     TODO
@@ -65,6 +62,7 @@ def worker_loop(model, local_rank):
 
 
 def run_async_server_mode(model, local_rank, host, port):
+    from .Simple_Remote_Infer.deploy.websocket_policy_server import WebsocketPolicyServer
     logger.info("Running in ASYNC SERVER mode")
     if local_rank == 0:
         dist_model = DistributedModelWrapper(model, local_rank=local_rank)

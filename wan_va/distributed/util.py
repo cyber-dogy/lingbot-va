@@ -12,7 +12,8 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     if dist.is_initialized():
         dist.barrier()
 
-    if dist.is_initialized():
+    # 单卡 smoke / 单卡训练不做 FSDP 包装，避免白白增加显存和同步开销。
+    if dist.is_initialized() and dist.get_world_size() > 1:
         model = shard_fn(model)
     else:
         model.to(param_dtype)
@@ -22,12 +23,12 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
 
 
 def init_distributed(world_size, local_rank, rank):
-    # if world_size > 1:
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl",
-                            init_method="env://",
-                            rank=rank,
-                            world_size=world_size)
+    if world_size > 1:
+        dist.init_process_group(backend="nccl",
+                                init_method="env://",
+                                rank=rank,
+                                world_size=world_size)
 
 def dist_mean(local_tensor):
     if dist.is_initialized():

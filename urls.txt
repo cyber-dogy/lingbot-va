@@ -1,0 +1,5 @@
+https://hf-mirror.com/datasets/robbyant/robotwin-clean-and-aug-lerobot/resolve/main/README.md
+https://hf-mirror.com/datasets/robbyant/robotwin-clean-and-aug-lerobot/resolve/main/meta/info.json
+https://hf-mirror.com/datasets/robbyant/robotwin-clean-and-aug-lerobot/resolve/main/meta/episodes.jsonl
+https://hf-mirror.com/datasets/robbyant/robotwin-clean-and-aug-lerobot/resolve/main/meta/tasks.jsonl
+https://hf-mirror.com/datasets/robbyant/robotwin-clean-and-aug-lerobot/resolve/main/videos/chunk-000/observation.images.cam_high/meta.json
