@@ -1,0 +1,9 @@
+robosuite==1.4.1
+bddl
+gym
+cloudpickle
+imageio[ffmpeg]
+opencv-python
+tqdm
+websockets
+msgpack
