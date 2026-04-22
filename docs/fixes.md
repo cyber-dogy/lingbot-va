@@ -79,3 +79,24 @@
 - `背景`：原默认值 `NUM_CHUNKS=2` 只会导出约 1.08 秒视频，不符合“每个任务输出 3-5 秒短视频”的目标。
 - `处理`：把 exporter 和 shell 包装的默认 `num_chunks / NUM_CHUNKS` 都改为 `6`，并补充中文注释说明当前 12 fps 下对应时长；随后用 `click_bell-aloha-agilex_randomized_500-1000` 重新执行默认配置验证。
 - `结果`：新默认已实测成功，`num_chunks=6` 时得到 `pred_video_frames=45`，按 `12 fps` 计算约 `3.75` 秒；验证产物位于 `eval_out/robotwin_task_demos/click_bell_3to5s_default/click_bell-aloha-agilex_randomized_500-1000`，指标为 `video_mse=0.003563 / action_mse=0.006737`；后续直接不传 `NUM_CHUNKS` 也会默认导出 3-5 秒短视频。
+
+### 2026-04-22 19:10:00 +0800 · 新增可独立迁移的 lingbot_va 包内结构线
+
+- `范围`：`lingbot_va/`、`pyproject.toml`
+- `背景`：需要在 `lingbot-va` 仓库里先起一条模仿 `pdit` 分层方式的新线，并且要求后续可以按单个目录整体打包迁走，不能依赖 `pdit` 或仓库外公共函数。
+- `处理`：新增顶层独立包 `lingbot_va`，内部按 `cli / config / data / model / policy / train / configs` 分层；在包内实现完整的配置读取、注册表、合成数据集、最小 transformer backbone、联合 latent-action policy、训练/评测/checkpoint CLI；同时把 `pyproject.toml` 改为显式包含 `lingbot_va.*`。
+- `结果`：`lingbot_va` 已能作为一条自包含结构线运行；已用 `conda run -n lingbot python -m lingbot_va.cli.train --config lingbot_va/configs/synthetic_smoke.json --set device="cpu" --set run_name="synthetic_check" --set train_epochs=1 --set train_size=16 --set valid_size=8 --set batch_size=4 --set print_every=2` 完成真实 smoke，产物落在 `train_out/lingbot_va/synthetic_check/`；关键结果为 `train_loss=0.272380 / valid_loss=0.240829 / global_step=4`；下一步可以在这条线内部继续替换成真实 LingBot-VA 数据与模型实现。
+
+### 2026-04-22 19:14:30 +0800 · lingbot_va 结构线已去除训练 warning 并补完 checkpoint 评测复验
+
+- `范围`：`lingbot_va/model/backbones/latent_action_transformer.py`、`lingbot_va/cli/eval_checkpoint.py`、`train_out/lingbot_va/synthetic_check_clean`
+- `背景`：首次 smoke 虽然已跑通，但 `TransformerEncoderLayer(norm_first=True)` 会产生一条与当前用途无关的 nested tensor warning；同时需要确认新线不只是训练能起，checkpoint 评测 CLI 也能闭环。
+- `处理`：把 `latent_action_transformer.py` 里的 encoder layer 改成 `norm_first=False` 以消除无关 warning；随后执行 `conda run -n lingbot python -m lingbot_va.cli.train --config lingbot_va/configs/synthetic_smoke.json --set device="cpu" --set run_name="synthetic_check_clean" --set train_epochs=1 --set train_size=8 --set valid_size=4 --set batch_size=4 --set print_every=1` 重新 smoke，并继续执行 `python -m lingbot_va.cli.eval_checkpoint ... --checkpoint train_out/lingbot_va/synthetic_check_clean/best.pt` 验证评测入口。
+- `结果`：warning 已消失；`synthetic_check_clean` 训练成功并生成 `latest.pt / best.pt / summary.json`，结果为 `train_loss=0.295025 / valid_loss=0.289173 / global_step=2`；`eval_checkpoint` 返回 `loss_total=0.289173 / loss_latent=0.155775 / loss_action=0.133399`，说明这条线的训练与 checkpoint 评测 CLI 都已跑通。
+
+### 2026-04-22 19:15:15 +0800 · lingbot_va 批量 checkpoint 评测入口已完成单目录复验
+
+- `范围`：`lingbot_va/cli/eval_all_checkpoints.py`、`train_out/lingbot_va/synthetic_check_clean/epochs/epoch_0001.pt`
+- `背景`：新线已经验证过单 checkpoint 评测，但还需要确认批量扫描周期 checkpoint 的 CLI 也能直接工作，避免后续做多轮训练时再补这条通路。
+- `处理`：执行 `conda run -n lingbot python -m lingbot_va.cli.eval_all_checkpoints --config lingbot_va/configs/synthetic_smoke.json --set device="cpu" --set run_name="synthetic_check_clean" --set train_size=8 --set valid_size=4 --set batch_size=4`，直接扫描 `epochs/` 目录。
+- `结果`：`eval_all_checkpoints` 已成功读取 `train_out/lingbot_va/synthetic_check_clean/epochs/epoch_0001.pt` 并返回 `loss_total=0.289173 / loss_latent=0.155775 / loss_action=0.133399`；说明新线的单 checkpoint 与批量 checkpoint 两条评测入口都已闭环。

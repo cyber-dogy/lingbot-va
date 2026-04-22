@@ -116,3 +116,29 @@
 
 1. 先确认目标 checkpoint 的 `attn_mode`
 2. 再接 `evaluation/robotwin` 或推理 server/client 脚本
+
+### 2026-04-22 · 独立 `lingbot_va` 结构线已落地并通过最小 smoke
+
+- 新增顶层包：
+  - `lingbot_va`
+- 新线特征：
+  - 内部分层对齐 `pdit` 的 `cli / config / data / model / policy / train`
+  - 不依赖 `pdit` 和仓库外公共函数
+  - 目录本身可以单独迁移，后续继续往里替换真实实现
+- 当前已具备：
+  - JSON 配置读取与 CLI override
+  - 数据注册表
+  - 合成 latent-action 数据集
+  - 最小 transformer backbone
+  - 联合 latent/action loss 的 policy
+  - 训练、评测、checkpoint 保存与 checkpoint 评测 CLI
+- 已验证结果：
+  - 环境：`conda run -n lingbot`
+  - 运行命令：`python -m lingbot_va.cli.train --config lingbot_va/configs/synthetic_smoke.json --set device="cpu" --set run_name="synthetic_check" --set train_epochs=1 --set train_size=16 --set valid_size=8 --set batch_size=4 --set print_every=2`
+  - 结果路径：`train_out/lingbot_va/synthetic_check`
+  - 指标：
+    - `train_loss=0.272380`
+    - `valid_loss=0.240829`
+    - `global_step=4`
+- 对下一步最有价值的意义：
+  - 现在我们已经有了一条“先搭结构、后替换真实 LingBot-VA 细节”的独立线，后面可以只在 `lingbot_va/` 内继续演进，不会反向污染 `wan_va`。

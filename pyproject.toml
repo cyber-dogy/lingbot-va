@@ -45,11 +45,12 @@ huggingface = "https://github.com/Robbyant"
 modelscope = "https://github.com/Robbyant"
 discord = "https://github.com/Robbyant"
 
-[tool.setuptools]
-packages = ["wan_va"]
+[tool.setuptools.packages.find]
+include = ["wan_va", "wan_va.*", "lingbot_va", "lingbot_va.*"]
 
 [tool.setuptools.package-data]
 "wan_va" = ["**/*.py"]
+"lingbot_va" = ["**/*.py", "**/*.json", "**/*.md"]
 
 [tool.black]
 line-length = 88
@@ -59,5 +60,4 @@ profile = "black"
 
 [tool.mypy]
 strict = true
-
 

@@ -1,32 +1,55 @@
-import numpy as np
-from wan_va.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
-import argparse
-from libero.libero import benchmark
-import time
-from libero.libero.envs import OffScreenRenderEnv
+import sys
 from pathlib import Path
-from tqdm import tqdm
-from lerobot.datasets.utils import write_json
+
+import argparse
 import os
-import imageio
+import time
+
 import cv2
+import imageio
+import numpy as np
+from libero.libero import benchmark
+from libero.libero.envs import OffScreenRenderEnv
+from lerobot.datasets.utils import write_json
+from tqdm import tqdm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+LINGBOT_ROOT = Path(__file__).resolve().parents[2]
+if str(LINGBOT_ROOT) not in sys.path:
+    sys.path.append(str(LINGBOT_ROOT))
+
+DEFAULT_LIBERO_HEADLESS_TOOLS_ROOT = PROJECT_ROOT / "autodl_unplug_charger_transformer_fm" / "libero" / "headless_tools"
+LIBERO_HEADLESS_TOOLS_ROOT = Path(
+    os.environ.get("LIBERO_HEADLESS_TOOLS_ROOT", str(DEFAULT_LIBERO_HEADLESS_TOOLS_ROOT))
+)
+if str(LIBERO_HEADLESS_TOOLS_ROOT) not in sys.path:
+    sys.path.append(str(LIBERO_HEADLESS_TOOLS_ROOT))
+
+from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+from rollout_artifacts import build_eval_artifact_paths, save_action_trace_artifact
 
 
-def save_video(real_obs_list, save_path, fps=15, video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]):
+def build_video_frames(real_obs_list, video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]):
     if not real_obs_list:
-        print("❌ No real observation frames")
-        return
+        return []
 
     first_obs = real_obs_list[0]
     base_h, width_base = first_obs[video_names[0]].shape[:2]
     target_size = (width_base, base_h)
-    
-    print(f"Saving video: {len(real_obs_list)} frames...")
 
-    final_frames = [
+    return [
         np.hstack([cv2.resize(obs[name], target_size) for name in video_names]).astype(np.uint8)
         for obs in real_obs_list
     ]
+
+
+def save_video(real_obs_list, save_path, fps=15, video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]):
+    final_frames = build_video_frames(real_obs_list, video_names=video_names)
+    if not final_frames:
+        print("❌ No real observation frames")
+        return
+
+    print(f"Saving video: {len(final_frames)} frames...")
 
     imageio.mimsave(save_path, final_frames, fps=fps)
     print(f"✅ Video saved to: {save_path}")
@@ -74,25 +97,28 @@ def env_one_step(env_in, action):
     return _extract_obs(obs), done
 
 
-def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
+def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx, artifact_dir=None, save_rollout_video=True, save_action_trace=True, fps=60):
     benchmark_dict = benchmark.get_benchmark_dict()
     benchmark_instance = benchmark_dict[libero_benchmark]()
     num_tasks = benchmark_instance.get_num_tasks()
     assert task_idx < num_tasks, f"Error: error id must smaller than {num_tasks}"
-    prompt = benchmark_instance.get_task(task_idx).language
+    task = benchmark_instance.get_task(task_idx)
+    prompt = task.language
     env_args = {
                 "bddl_file_name": benchmark_instance.get_task_bddl_file_path(task_idx),
                 "camera_heights": 128,
                 "camera_widths": 128,
             }
     init_states = benchmark_instance.get_task_init_states(task_idx)
+    initial_state = init_states[episode_idx % init_states.shape[0]]
 
     cur_env = construct_single_env(env_args)
-    first_obs = init_single_env(cur_env, init_states[episode_idx % init_states.shape[0]])
+    first_obs = init_single_env(cur_env, initial_state)
 
     ret = model.infer(dict(reset=True, prompt=prompt))
 
     full_obs_list = []
+    executed_actions = []
     done = False
     first = True
     while cur_env.env.timestep < 800:
@@ -106,6 +132,7 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
         for i in range(start_idx, action.shape[1]):
             for j in range(action.shape[2]):
                 ee_action = action[:, i, j]
+                executed_actions.append(np.asarray(ee_action, dtype=np.float32).copy())
                 observes, done = env_one_step(cur_env, ee_action)
                 if done:
                     break
@@ -123,21 +150,59 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
         else:
             model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
 
-    out_file = Path(out_dir) / libero_benchmark / f"{task_idx}_{prompt.replace(' ', '_')}" / f"{episode_idx}_{done}.mp4"
-    out_file.parent.mkdir(exist_ok=True, parents=True)
-
-    save_video(
-        real_obs_list=full_obs_list,
-        save_path=out_file,
-        fps=60,
-        video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]
+    # 统一把评测产物写到同一目录结构，后面筛成功案例和重放 trace 会更方便。
+    action_trace_path, rollout_video_path = build_eval_artifact_paths(
+        model_tag="lingbot_va",
+        suite_name=libero_benchmark,
+        task_id=task_idx,
+        episode_idx=episode_idx,
+        success=done,
+        task_name=task.name,
+        output_root=artifact_dir,
     )
+
+    if save_rollout_video:
+        save_video(
+            real_obs_list=full_obs_list,
+            save_path=rollout_video_path,
+            fps=fps,
+            video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]
+        )
+
+    if save_action_trace and len(executed_actions) > 0:
+        save_action_trace_artifact(
+            action_trace_path,
+            executed_actions,
+            initial_state=initial_state,
+            metadata={
+                "model_tag": "lingbot_va",
+                "suite_name": libero_benchmark,
+                "task_id": task_idx,
+                "task_name": task.name,
+                "instruction": prompt,
+                "episode_idx": episode_idx,
+                "success": bool(done),
+            },
+        )
+        print(f"✅ Action trace saved to: {action_trace_path}")
+    elif save_action_trace:
+        print("⚠️ Skip saving action trace because executed_actions is empty")
 
     cur_env.close()
     return done
 
 
-def run(libero_benchmark, port, out_dir, test_num, task_range=None):
+def run(
+    libero_benchmark,
+    port,
+    out_dir,
+    test_num,
+    task_range=None,
+    artifact_dir=None,
+    disable_rollout_video=False,
+    disable_action_trace=False,
+    fps=60,
+):
     '''
         task_range: [start, end) for splitting tasks
     '''
@@ -167,7 +232,17 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
             succ_num = 0.
 
         for episode_idx in tqdm(episode_list, total=len(episode_list)):
-            res_i = run_one(model, libero_benchmark, task_idx, out_dir, episode_idx)
+            res_i = run_one(
+                model,
+                libero_benchmark,
+                task_idx,
+                out_dir,
+                episode_idx,
+                artifact_dir=artifact_dir,
+                save_rollout_video=not disable_rollout_video,
+                save_action_trace=not disable_action_trace,
+                fps=fps,
+            )
             succ_num += res_i
             succ_rate = succ_num / (episode_idx + 1)
             print(f"Success rate: {succ_rate}, success num: {succ_num}, total num: {episode_idx + 1}")
@@ -214,6 +289,28 @@ def main():
         type=str,
         default="outputs/libero",
         help="Output directory for results",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=None,
+        help="统一保存 rollout 视频和 action trace 的目录；为空时默认写到 autodl_unplug_charger_transformer_fm/libero/headless_tools/output/evals/lingbot_va",
+    )
+    parser.add_argument(
+        "--disable-rollout-video",
+        action="store_true",
+        help="只跑评测，不保存 rollout 视频",
+    )
+    parser.add_argument(
+        "--disable-action-trace",
+        action="store_true",
+        help="只保存视频，不保存 action trace",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=60,
+        help="rollout 视频帧率",
     )
     args = parser.parse_args()
     run(**vars(args))
